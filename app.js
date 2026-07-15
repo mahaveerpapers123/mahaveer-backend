@@ -13,10 +13,10 @@ const ordersRouter = require("./routes/orders");
 const checkoutRouter = require("./routes/checkout");
 const reviewsRouter = require("./routes/reviews");
 const adminRouter = require("./routes/admin");
+const inventoryRouter = require("./routes/inventory");
 const shippingRouter = require("./routes/shipping");
 const trackingRouter = require("./routes/tracking");
 const razorpayRouter = require("./routes/razorpay");
-const inventoryRouter = require("./routes/inventory");
 
 const app = express();
 
@@ -39,7 +39,10 @@ app.use(
         return callback(null, true);
       }
 
-      const error = new Error(`CORS blocked for origin: ${origin}`);
+      const error = new Error(
+        `CORS blocked for origin: ${origin}`
+      );
+
       error.statusCode = 403;
 
       return callback(error);
@@ -64,8 +67,6 @@ app.use(
     ]
   })
 );
-
-app.options("*", cors());
 
 app.use(
   "/api/razorpay/webhook",
@@ -161,7 +162,9 @@ const PORT = Number(process.env.PORT || 5000);
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(
+      `Server running on http://localhost:${PORT}`
+    );
   });
 }
 
