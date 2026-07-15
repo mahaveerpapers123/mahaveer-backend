@@ -1,50 +1,38 @@
 const express = require('express');
-const pool    = require('../db');
+const pool = require('../db');
 
 const router = express.Router();
 
-/* -----------------------------------------------------------
-   GET /api/categories
-   Returns something like:
-   [
-     { "label": "All Categories", "value": "all" },
-     { "label": "Notebooks & Diaries", "value": "notebooks-diaries" },
-     { "label": "Pens & Pencils",      "value": "pens-pencils"      },
-     { "label": "Art Supplies",        "value": "art-supplies"      }
-     …
-   ]
-   -----------------------------------------------------------*/
-router.get('/', async (_req, res) => {
+router.get('/', async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      /*  pull every leaf menu item (no children) that is published  */
-      WITH leaves AS (
-        SELECT n1.id
-        FROM   "NavLinks" n1
-        WHERE  NOT EXISTS (
-                 SELECT 1 FROM "NavLinks" n2
-                 WHERE  n2.parent_id = n1.id
+    const includeParents = String(req.query.includeParents || 'false').toLowerCase() === 'true';
+    const result = await pool.query(
+      includeParents
+        ? `SELECT id, parent_id, label, REGEXP_REPLACE(slug, '^/', '') AS value, display_order, published
+           FROM "NavLinks"
+           WHERE published = true
+           ORDER BY parent_id NULLS FIRST, display_order, label`
+        : `WITH leaves AS (
+             SELECT n.id
+             FROM "NavLinks" n
+             WHERE n.published = true
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM "NavLinks" child
+                 WHERE child.parent_id = n.id AND child.published = true
                )
-          AND  n1.published
-      )
-      SELECT label AS label,
-             REGEXP_REPLACE(slug, '^\/', '') AS value   -- "/stationery/notebooks" ➜ "stationery/notebooks"
-      FROM   "NavLinks"
-      WHERE  id IN (SELECT id FROM leaves)
-      ORDER  BY label;
-    `);
+           )
+           SELECT n.id, n.parent_id, n.label, REGEXP_REPLACE(n.slug, '^/', '') AS value, n.display_order, n.published
+           FROM "NavLinks" n
+           JOIN leaves l ON l.id = n.id
+           ORDER BY n.label`
+    );
 
-    /* prepend the universal option */
-    const options = [
-      { label: 'All Categories', value: 'all' },
-      ...rows
-    ];
-
+    const options = [{ id: null, parent_id: null, label: 'All Categories', value: 'all', display_order: 0, published: true }, ...result.rows];
     res.setHeader('Cache-Control', 'no-store');
-    res.json(options);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Unable to load categories' });
+    return res.json(options);
+  } catch (error) {
+    return res.status(500).json({ error: 'Unable to load categories', detail: String(error.message || error) });
   }
 });
 

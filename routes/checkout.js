@@ -1,212 +1,457 @@
-const express = require("express");
-const router = express.Router();
-const db = require("../db");
+const express = require('express');
+const pool = require('../db');
+const {
+  INVENTORY_ENABLED,
+  generatePickupCode,
+  hashPickupCode,
+  getLocationByCode,
+  ensureInventoryRows,
+  reserveOrderItems,
+  recordOrderStatus
+} = require('../lib/inventory');
 
-function num(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+const router = express.Router();
+
+function text(value) {
+  return String(value ?? '').trim();
 }
 
-function toMinor(value) {
+function positiveInteger(value) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function moneyMinor(value) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n * 100) : 0;
 }
 
-function getShippingChargeMinor(subtotalMinor) {
+function clampPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function shippingChargeMinor(subtotalMinor, fulfillmentType) {
+  if (fulfillmentType === 'PICKUP') return 0;
   if (!Number.isFinite(subtotalMinor) || subtotalMinor <= 0) return 0;
   return subtotalMinor < 100000 ? 7500 : 0;
 }
 
-router.post("/", async (req, res) => {
-  const client = await db.connect();
+function normalizeFulfillment(value) {
+  const normalized = text(value || 'DELIVERY').toUpperCase();
+  return ['DELIVERY', 'PICKUP'].includes(normalized) ? normalized : null;
+}
+
+function normalizePayment(value, fulfillmentType) {
+  const normalized = text(value || (fulfillmentType === 'PICKUP' ? 'PAY_AT_STORE' : 'COD')).toUpperCase();
+  if (fulfillmentType === 'DELIVERY' && ['ONLINE', 'COD'].includes(normalized)) return normalized;
+  if (fulfillmentType === 'PICKUP' && ['ONLINE', 'PAY_AT_STORE'].includes(normalized)) return normalized;
+  return null;
+}
+
+function addressObject(source = {}, fallback = {}) {
+  const address = source.address && typeof source.address === 'object' ? source.address : source;
+  return {
+    name: text(source.name || fallback.name) || null,
+    email: text(source.email || fallback.email) || null,
+    line1: text(address.line1 || address.address1) || null,
+    line2: text(address.line2 || address.address2) || null,
+    city: text(address.city) || null,
+    state: text(address.state) || null,
+    postal_code: text(address.postal_code || address.pincode || address.zip) || null,
+    country: text(address.country || 'India') || 'India',
+    phone: text(address.phone || source.phone || fallback.phone) || null
+  };
+}
+
+function reservationExpiry(paymentMethod) {
+  const minutes = paymentMethod === 'ONLINE'
+    ? Number(process.env.ONLINE_RESERVATION_MINUTES || 30)
+    : Number(process.env.OFFLINE_RESERVATION_MINUTES || 1440);
+  const safeMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 30;
+  return new Date(Date.now() + safeMinutes * 60 * 1000);
+}
+
+router.post('/', async (req, res) => {
+  const client = await pool.connect();
 
   try {
-    const { billing = {}, shipping = {}, payment = {}, items = [] } = req.body || {};
+    const body = req.body || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    const fulfillmentType = normalizeFulfillment(body.fulfillment_type || body.fulfillmentType);
+    const paymentMethod = normalizePayment(body.payment?.method || body.payment_method || body.paymentMethod, fulfillmentType);
+    const locationCode = text(body.location_code || body.locationCode || 'MAIN-SHOP').toUpperCase();
+    const requestedUserId = body.user_id ?? body.userId ?? null;
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ message: "No items in order" });
+    if (!items.length) return res.status(400).json({ error: 'No items in order' });
+    if (!fulfillmentType) return res.status(400).json({ error: 'Invalid fulfillment type' });
+    if (!paymentMethod) return res.status(400).json({ error: 'Invalid payment method for fulfillment type' });
+
+    await client.query('BEGIN');
+
+    const location = await getLocationByCode(client, locationCode);
+    if (!location || !location.is_active) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Inventory location not found or inactive' });
     }
 
-    await client.query("BEGIN");
+    if (fulfillmentType === 'PICKUP' && !location.pickup_enabled) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: 'Pickup is not enabled at this location' });
+    }
 
-    const normalizedItems = items.map((item) => {
-      const quantity = Math.max(1, Number(item.quantity || item.qty || 1));
+    let user = null;
+    if (requestedUserId !== null && requestedUserId !== undefined && requestedUserId !== '') {
+      const userResult = await client.query(
+        `SELECT id, name, email, phone, user_type, gst_number, gst_verified, is_active
+         FROM "Users"
+         WHERE id = $1
+         LIMIT 1`,
+        [requestedUserId]
+      );
+      user = userResult.rows[0] || null;
+      if (!user || user.is_active === false) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'Customer account not found or inactive' });
+      }
+    }
 
-      let unitPriceMinor = Number(item.unit_price_minor);
+    const customerType = user?.user_type === 'b2b' && user?.gst_verified === true ? 'B2B' : 'B2C';
+    if (!['B2C', 'B2B'].includes(customerType)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid customer type' });
+    }
 
-      if (!Number.isFinite(unitPriceMinor) || unitPriceMinor <= 0) {
-        const rupeePrice = Number(item.mahaveer_price ?? item.price ?? item.mrp ?? 0);
-        unitPriceMinor = Number.isFinite(rupeePrice) ? toMinor(rupeePrice) : 0;
+    const billing = addressObject(body.billing || {}, {
+      name: user?.name,
+      email: user?.email,
+      phone: user?.phone
+    });
+    const shipping = addressObject(body.shipping || {}, billing);
+
+    const email = text(user?.email || billing.email || body.email) || null;
+
+    if (!email) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Customer email is required' });
+    }
+
+    if (fulfillmentType === 'DELIVERY') {
+      const required = ['name', 'line1', 'city', 'state', 'postal_code', 'phone'];
+      const missing = required.filter((field) => !shipping[field]);
+      if (missing.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Missing shipping fields: ${missing.join(', ')}` });
+      }
+    }
+
+    const normalizedItems = [];
+
+    for (const rawItem of items) {
+      const productId = rawItem.product_id || rawItem.productId || rawItem.id;
+      const quantity = positiveInteger(rawItem.quantity || rawItem.qty || 1);
+
+      if (!productId || !quantity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Every item requires product_id and a positive quantity' });
       }
 
-      const subtotalMinor = quantity * unitPriceMinor;
+      const productResult = await client.query(
+        `SELECT
+           p.id,
+           p.sku,
+           p.name,
+           p.model_name,
+           p.brand,
+           p.category_slug,
+           p.barcode,
+           p.colour,
+           p.hsn_code,
+           p.hsn_percentage,
+           p.mrp,
+           p.mahaveer_price,
+           p.discount_b2b,
+           p.discount_b2c,
+           p.weight,
+           p.length,
+           p.width,
+           p.height,
+           p.images,
+           p.unit,
+           p.pack_size,
+           p.purchase_price,
+           p.track_inventory,
+           p.published,
+           p.is_active,
+           p.deleted_at,
+           COALESCE(b.name, p.brand) AS brand_name
+         FROM "Products" p
+         LEFT JOIN brands b ON b.id = p.brand_id
+         WHERE p.id = $1
+         LIMIT 1`,
+        [productId]
+      );
 
-      return {
-        product_id: item.product_id || item.id || null,
-        product_name: String(item.product_name || item.name || "Item"),
-        unit_price_minor: unitPriceMinor,
+      const product = productResult.rows[0];
+
+      if (!product || !product.published || !product.is_active || product.deleted_at) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: `Product not available: ${productId}` });
+      }
+
+      const basePrice = Number(product.mahaveer_price || 0);
+      const discount = customerType === 'B2B'
+        ? clampPercent(product.discount_b2b)
+        : clampPercent(product.discount_b2c);
+      const unitPrice = Number((basePrice * (1 - discount / 100)).toFixed(2));
+      const unitPriceMinor = moneyMinor(unitPrice);
+
+      if (unitPriceMinor <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: `Invalid selling price for ${product.name}` });
+      }
+
+      const images = Array.isArray(product.images) ? product.images : [];
+
+      normalizedItems.push({
+        productId: product.id,
+        productName: product.name,
+        sku: product.sku,
+        barcode: product.barcode,
+        brand: product.brand_name || product.brand,
+        categorySlug: product.category_slug,
+        modelName: product.model_name,
+        colour: product.colour,
+        hsnCode: product.hsn_code,
+        hsnPercentage: product.hsn_percentage,
+        mrp: product.mrp,
+        mahaveerPrice: product.mahaveer_price,
+        purchasePrice: product.purchase_price,
+        unit: product.unit,
+        packSize: product.pack_size,
+        weight: product.weight,
+        length: product.length,
+        width: product.width,
+        height: product.height,
+        imageUrl: images[0] || null,
         quantity,
-        subtotal_minor: subtotalMinor,
-        image_url:
-          item.image_url ||
-          item.image ||
-          (Array.isArray(item.images) ? item.images[0] : null) ||
-          null,
-        height: num(item.height),
-        width: num(item.width),
-        length: num(item.length),
-        weight: num(item.weight),
-        mahaveer_price: num(item.mahaveer_price ?? item.price),
-        hsn_percentage: num(item.hsn_percentage),
-        mrp: num(item.mrp)
-      };
-    });
+        unitPriceMinor,
+        subtotalMinor: quantity * unitPriceMinor,
+        trackInventory: product.track_inventory !== false
+      });
+    }
 
-    const itemsSubtotalMinor = normalizedItems.reduce(
-      (sum, item) => sum + item.subtotal_minor,
-      0
-    );
+    const subtotalAmount = normalizedItems.reduce((sum, item) => sum + item.subtotalMinor, 0);
+    const shippingAmount = shippingChargeMinor(subtotalAmount, fulfillmentType);
+    const discountAmount = 0;
+    const taxAmount = 0;
+    const totalAmount = subtotalAmount + shippingAmount - discountAmount + taxAmount;
+    const expiresAt = reservationExpiry(paymentMethod);
+    const pickupCode = fulfillmentType === 'PICKUP' ? generatePickupCode() : null;
+    const pickupCodeHash = pickupCode ? hashPickupCode(pickupCode) : null;
 
-    const shippingChargeMinor = getShippingChargeMinor(itemsSubtotalMinor);
-    const finalTotalMinor = itemsSubtotalMinor + shippingChargeMinor;
-
-    const shippingAddress = {
-      name: shipping?.name || billing?.name || null,
-      line1: shipping?.address?.line1 || shipping?.line1 || null,
-      line2: shipping?.address?.line2 || shipping?.line2 || null,
-      city: shipping?.address?.city || shipping?.city || null,
-      state: shipping?.address?.state || shipping?.state || null,
-      postal_code: shipping?.address?.postal_code || shipping?.postal_code || null,
-      country: shipping?.address?.country || shipping?.country || "India",
-      phone: shipping?.address?.phone || shipping?.phone || billing?.phone || null,
-      shipping_charge: shippingChargeMinor / 100,
-      shipping_charge_minor: shippingChargeMinor
-    };
+    const shippingAddress = fulfillmentType === 'DELIVERY'
+      ? {
+          ...shipping,
+          shipping_charge: shippingAmount / 100,
+          shipping_charge_minor: shippingAmount
+        }
+      : {
+          pickup_location_id: location.id,
+          pickup_location_name: location.name,
+          pickup_location_code: location.code,
+          customer_name: billing.name,
+          customer_phone: billing.phone
+        };
 
     const billingAddress = {
-      name: billing?.name || null,
-      email: billing?.email || null,
-      line1: billing?.address?.line1 || billing?.line1 || null,
-      line2: billing?.address?.line2 || billing?.line2 || null,
-      city: billing?.address?.city || billing?.city || null,
-      state: billing?.address?.state || billing?.state || null,
-      postal_code: billing?.address?.postal_code || billing?.postal_code || null,
-      country: billing?.address?.country || billing?.country || "India",
-      phone: billing?.address?.phone || billing?.phone || null,
-      items_subtotal: itemsSubtotalMinor / 100,
-      items_subtotal_minor: itemsSubtotalMinor,
-      shipping_charge: shippingChargeMinor / 100,
-      shipping_charge_minor: shippingChargeMinor,
-      total: finalTotalMinor / 100,
-      total_minor: finalTotalMinor
+      ...billing,
+      items_subtotal: subtotalAmount / 100,
+      items_subtotal_minor: subtotalAmount,
+      shipping_charge: shippingAmount / 100,
+      shipping_charge_minor: shippingAmount,
+      discount: discountAmount / 100,
+      discount_minor: discountAmount,
+      tax: taxAmount / 100,
+      tax_minor: taxAmount,
+      total: totalAmount / 100,
+      total_minor: totalAmount,
+      gst_number: customerType === 'B2B' ? user?.gst_number || body.gst_number || null : null
     };
 
-    const paymentMethod = String(payment?.method || "COD").toUpperCase();
-
-    const orderInsert = await client.query(
-      `
-      INSERT INTO orders (
-        email,
-        total_amount,
-        currency,
-        payment_status,
-        order_status,
-        fulfill_status,
-        shipping_addr,
-        billing_addr
-      )
-      VALUES (
-        $1,
-        $2,
-        'INR',
-        'PENDING',
-        'PENDING',
-        'NOT_PACKED',
-        $3::jsonb,
-        $4::jsonb
-      )
-      RETURNING id, total_amount
-      `,
+    const orderResult = await client.query(
+      `INSERT INTO orders (
+         user_id,
+         email,
+         total_amount,
+         currency,
+         payment_status,
+         order_status,
+         fulfill_status,
+         decision_status,
+         billing_addr,
+         shipping_addr,
+         fulfillment_type,
+         inventory_location_id,
+         customer_type,
+         order_channel,
+         payment_method,
+         subtotal_amount,
+         shipping_amount,
+         discount_amount,
+         tax_amount,
+         reserved_until,
+         pickup_code_hash,
+         pickup_expires_at,
+         customer_notes,
+         updated_at
+       ) VALUES (
+         $1, $2, $3, 'INR', 'PENDING', 'PENDING', 'NOT_PACKED', 'Pending',
+         $4::jsonb, $5::jsonb, $6, $7, $8, 'WEBSITE', $9,
+         $10, $11, $12, $13, $14, $15, $16, $17, NOW()
+       )
+       RETURNING *`,
       [
-        billing?.email || null,
-        finalTotalMinor,
+        user?.id || null,
+        email,
+        totalAmount,
+        JSON.stringify(billingAddress),
         JSON.stringify(shippingAddress),
-        JSON.stringify(billingAddress)
+        fulfillmentType,
+        location.id,
+        customerType,
+        paymentMethod,
+        subtotalAmount,
+        shippingAmount,
+        discountAmount,
+        taxAmount,
+        expiresAt,
+        pickupCodeHash,
+        null,
+        text(body.customer_notes || body.customerNotes) || null
       ]
     );
 
-    const orderId = orderInsert.rows[0].id;
+    const order = orderResult.rows[0];
+    const reservationItems = [];
 
-    const columns = [
-      "order_id",
-      "product_id",
-      "product_name",
-      "unit_price_minor",
-      "quantity",
-      "subtotal_minor",
-      "image_url",
-      "height",
-      "width",
-      "length",
-      "weight",
-      "mahaveer_price",
-      "hsn_percentage",
-      "mrp"
-    ];
-
-    const values = [];
-
-    const placeholders = normalizedItems
-      .map((item, index) => {
-        const base = index * columns.length;
-
-        values.push(
-          orderId,
-          item.product_id,
-          item.product_name,
-          item.unit_price_minor,
+    for (const item of normalizedItems) {
+      const itemResult = await client.query(
+        `INSERT INTO order_items (
+           order_id,
+           product_id,
+           product_name,
+           unit_price_minor,
+           quantity,
+           subtotal_minor,
+           image_url,
+           height,
+           width,
+           length,
+           weight,
+           mahaveer_price,
+           hsn_percentage,
+           mrp,
+           brand,
+           category_slug,
+           model_name,
+           sku,
+           barcode,
+           hsn_code,
+           unit,
+           pack_size,
+           purchase_price,
+           inventory_location_id
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+           $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+         )
+         RETURNING id`,
+        [
+          order.id,
+          item.productId,
+          item.productName,
+          item.unitPriceMinor,
           item.quantity,
-          item.subtotal_minor,
-          item.image_url,
+          item.subtotalMinor,
+          item.imageUrl,
           item.height,
           item.width,
           item.length,
           item.weight,
-          item.mahaveer_price,
-          item.hsn_percentage,
-          item.mrp
-        );
+          item.mahaveerPrice,
+          item.hsnPercentage,
+          item.mrp,
+          item.brand,
+          item.categorySlug,
+          item.modelName,
+          item.sku,
+          item.barcode,
+          item.hsnCode,
+          item.unit,
+          item.packSize,
+          item.purchasePrice,
+          location.id
+        ]
+      );
 
-        return `(${columns.map((_, columnIndex) => `$${base + columnIndex + 1}`).join(", ")})`;
-      })
-      .join(", ");
+      if (item.trackInventory) {
+        reservationItems.push({
+          orderItemId: itemResult.rows[0].id,
+          productId: item.productId,
+          productName: item.productName,
+          quantity: item.quantity
+        });
+      }
+    }
 
-    await client.query(
-      `
-      INSERT INTO order_items
-        (${columns.join(", ")})
-      VALUES ${placeholders}
-      `,
-      values
+    if (reservationItems.length) {
+      await ensureInventoryRows(client, reservationItems.map((item) => item.productId), location.id);
+      await reserveOrderItems(client, {
+        orderId: order.id,
+        locationId: location.id,
+        items: reservationItems,
+        expiresAt
+      });
+    }
+
+    await recordOrderStatus(client, order.id, 'ORDER', null, 'PENDING', 'Order created');
+    await recordOrderStatus(client, order.id, 'PAYMENT', null, 'PENDING', paymentMethod);
+    await recordOrderStatus(
+      client,
+      order.id,
+      'FULFILLMENT',
+      null,
+      INVENTORY_ENABLED && reservationItems.length ? 'RESERVED' : 'NOT_PACKED',
+      fulfillmentType
     );
 
-    await client.query("COMMIT");
+    await client.query('COMMIT');
 
-    res.status(201).json({
-      message: "Order placed successfully",
-      orderId,
+    return res.status(201).json({
+      message: 'Order placed successfully',
+      orderId: order.id,
+      fulfillment_type: fulfillmentType,
       payment_method: paymentMethod,
-      subtotal: itemsSubtotalMinor / 100,
-      shipping_charge: shippingChargeMinor / 100,
-      total: finalTotalMinor / 100,
-      total_amount: finalTotalMinor
+      customer_type: customerType,
+      inventory_enforced: INVENTORY_ENABLED,
+      reservation_expires_at: expiresAt,
+      pickup_code: pickupCode,
+      subtotal: subtotalAmount / 100,
+      shipping_charge: shippingAmount / 100,
+      discount: discountAmount / 100,
+      tax: taxAmount / 100,
+      total: totalAmount / 100,
+      total_amount: totalAmount
     });
-  } catch (err) {
-    await client.query("ROLLBACK");
-
-    res.status(500).json({
-      message: "Server error",
-      error: err.message
+  } catch (error) {
+    await client.query('ROLLBACK');
+    const status = error.code === 'INSUFFICIENT_STOCK' ? 409 : 500;
+    return res.status(status).json({
+      error: error.code === 'INSUFFICIENT_STOCK' ? 'Insufficient stock' : 'Checkout failed',
+      detail: String(error.message || error),
+      ...(error.details ? { details: error.details } : {})
     });
   } finally {
     client.release();
