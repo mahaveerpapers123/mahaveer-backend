@@ -59,6 +59,10 @@ function normalizeSlug(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+function normalizeAlias(value) {
+  return text(value).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 function normalizeImageKey(value) {
   return text(value)
     .toLowerCase()
@@ -91,6 +95,12 @@ function safeJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function requestError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
 }
 
 function imageUrlsFromBody(body) {
@@ -183,98 +193,118 @@ function validateProduct(body) {
 
 async function resolveBrand(client, body) {
   if (body.brand_id) {
-    const result = await client.query(`SELECT id, name FROM brands WHERE id = $1 AND is_active = true LIMIT 1`, [body.brand_id]);
-    if (result.rowCount) return result.rows[0];
+    const result = await client.query(
+      `SELECT id, name, slug
+       FROM brands
+       WHERE id = $1
+         AND is_active = true
+       LIMIT 1`,
+      [body.brand_id]
+    );
+
+    if (!result.rowCount) {
+      throw requestError('Invalid or inactive brand_id', 422);
+    }
+
+    return result.rows[0];
   }
 
   const rawName = text(body.brand);
-  const normalized = rawName.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  if (!rawName) return null;
 
-  const alias = await client.query(
-    `SELECT b.id, b.name
-     FROM brand_aliases a
-     JOIN brands b ON b.id = a.brand_id
-     WHERE a.normalized_alias = $1 AND b.is_active = true
-     LIMIT 1`,
-    [normalized]
-  );
-  if (alias.rowCount) return alias.rows[0];
+  if (!rawName) {
+    throw requestError('brand or brand_id is required', 422);
+  }
 
-  const existing = await client.query(
-    `SELECT id, name
+  const exact = await client.query(
+    `SELECT id, name, slug
      FROM brands
-     WHERE LOWER(BTRIM(name)) = LOWER(BTRIM($1))
+     WHERE is_active = true
+       AND LOWER(BTRIM(name)) = LOWER(BTRIM($1))
      LIMIT 1`,
     [rawName]
   );
-  if (existing.rowCount) return existing.rows[0];
 
-  const baseSlug = normalizeSlug(rawName) || `brand-${Date.now()}`;
-  let slug = baseSlug;
-  let suffix = 1;
+  if (exact.rowCount) return exact.rows[0];
 
-  while (true) {
-    const inserted = await client.query(
-      `INSERT INTO brands (name, slug, is_active, created_at, updated_at)
-       VALUES ($1, $2, true, NOW(), NOW())
-       ON CONFLICT DO NOTHING
-       RETURNING id, name`,
-      [rawName, slug]
-    );
+  const slugMatch = await client.query(
+    `SELECT id, name, slug
+     FROM brands
+     WHERE is_active = true
+       AND LOWER(BTRIM(slug)) = LOWER(BTRIM($1))
+     LIMIT 1`,
+    [normalizeSlug(rawName)]
+  );
 
-    if (inserted.rowCount) {
-      await client.query(
-        `INSERT INTO brand_aliases (brand_id, alias, normalized_alias, created_at)
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (normalized_alias) DO NOTHING`,
-        [inserted.rows[0].id, rawName, normalized]
-      );
-      return inserted.rows[0];
-    }
+  if (slugMatch.rowCount) return slugMatch.rows[0];
 
-    const duplicate = await client.query(
-      `SELECT id, name
-       FROM brands
-       WHERE LOWER(BTRIM(name)) = LOWER(BTRIM($1))
-       LIMIT 1`,
-      [rawName]
-    );
-    if (duplicate.rowCount) return duplicate.rows[0];
+  const normalized = normalizeAlias(rawName);
 
-    suffix += 1;
-    slug = `${baseSlug}-${suffix}`;
-  }
+  const alias = await client.query(
+    `SELECT b.id, b.name, b.slug
+     FROM brand_aliases a
+     JOIN brands b ON b.id = a.brand_id
+     WHERE a.normalized_alias = $1
+       AND b.is_active = true
+     LIMIT 1`,
+    [normalized]
+  );
+
+  if (alias.rowCount) return alias.rows[0];
+
+  throw requestError(`Unknown brand: ${rawName}`, 422);
 }
 
 async function resolveCategory(client, body) {
   if (body.category_id) {
     const result = await client.query(
-      `SELECT id, REGEXP_REPLACE(slug, '^/', '') AS slug
+      `SELECT
+         id,
+         label,
+         REGEXP_REPLACE(slug, '^/', '') AS slug
        FROM "NavLinks"
        WHERE id = $1
+         AND published = true
        LIMIT 1`,
       [body.category_id]
     );
-    if (result.rowCount) return result.rows[0];
+
+    if (!result.rowCount) {
+      throw requestError('Invalid or unpublished category_id', 422);
+    }
+
+    return result.rows[0];
   }
 
-  const raw = text(body.category_slug);
-  if (!raw) return { id: null, slug: null };
-  const normalized = raw.replace(/^\/+/, '');
+  const raw = text(body.category_slug || body.category);
+
+  if (!raw) {
+    throw requestError('category_slug or category_id is required', 422);
+  }
+
+  const normalized = normalizeSlug(raw.replace(/^\/+/, ''));
 
   const result = await client.query(
-    `SELECT id, REGEXP_REPLACE(slug, '^/', '') AS slug
+    `SELECT
+       id,
+       label,
+       REGEXP_REPLACE(slug, '^/', '') AS slug
      FROM "NavLinks"
-     WHERE LOWER(REGEXP_REPLACE(slug, '^/', '')) = LOWER($1)
-        OR LOWER(REGEXP_REPLACE(REPLACE(slug, '/', '-'), '^-+', '')) = LOWER($2)
-     ORDER BY published DESC
+     WHERE published = true
+       AND (
+         LOWER(REGEXP_REPLACE(slug, '^/', '')) = LOWER($1)
+         OR LOWER(BTRIM(REGEXP_REPLACE(slug, '^/', ''))) = LOWER($1)
+         OR LOWER(BTRIM(BTRIM(REGEXP_REPLACE(label, '[^a-zA-Z0-9]+', '-', 'g'), '-'))) = LOWER($1)
+       )
+     ORDER BY parent_id NULLS FIRST, display_order, label
      LIMIT 1`,
-    [normalized, normalizeSlug(normalized)]
+    [normalized]
   );
 
-  if (result.rowCount) return result.rows[0];
-  return { id: null, slug: normalizeSlug(normalized) || normalized.toLowerCase() };
+  if (!result.rowCount) {
+    throw requestError(`Unknown category: ${raw}`, 422);
+  }
+
+  return result.rows[0];
 }
 
 function productValues(body, brand, category) {
@@ -898,9 +928,38 @@ async function resolveImagesForPayload(body) {
 
 router.get('/ping-bulk', (_req, res) => res.json({ ok: true, route: 'products routes working' }));
 
-router.get('/brands', async (_req, res) => {
+router.get('/brands', async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id, name, slug, logo_url, is_active FROM brands ORDER BY name`);
+    const query = text(req.query.query || req.query.q);
+    const activeOnly = req.query.activeOnly === undefined ? true : booleanValue(req.query.activeOnly, true);
+    const params = [];
+    const where = [];
+
+    if (activeOnly) where.push('b.is_active = true');
+
+    if (query) {
+      params.push(`%${query}%`);
+      where.push(`(b.name ILIKE $${params.length} OR b.slug ILIKE $${params.length})`);
+    }
+
+    const result = await pool.query(
+      `SELECT
+         b.id,
+         b.name,
+         b.slug,
+         b.is_active,
+         COALESCE(
+           jsonb_agg(a.alias ORDER BY a.alias) FILTER (WHERE a.id IS NOT NULL),
+           '[]'::jsonb
+         ) AS aliases
+       FROM brands b
+       LEFT JOIN brand_aliases a ON a.brand_id = b.id
+       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+       GROUP BY b.id
+       ORDER BY b.name`,
+      params
+    );
+
     return res.json({ brands: result.rows });
   } catch (error) {
     return res.status(500).json({ error: String(error.message || error) });

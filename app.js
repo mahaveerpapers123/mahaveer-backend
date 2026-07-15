@@ -7,6 +7,7 @@ const path = require("path");
 const navlinksRouter = require("./routes/navlinks");
 const productsRouter = require("./routes/products");
 const categoriesRouter = require("./routes/categories");
+const brandsRouter = require("./routes/brands");
 const authRouter = require("./routes/auth");
 const uploadRouter = require("./routes/upload");
 const ordersRouter = require("./routes/orders");
@@ -39,23 +40,12 @@ app.use(
         return callback(null, true);
       }
 
-      const error = new Error(
-        `CORS blocked for origin: ${origin}`
-      );
-
+      const error = new Error(`CORS blocked for origin: ${origin}`);
       error.statusCode = 403;
-
       return callback(error);
     },
     credentials: true,
-    methods: [
-      "GET",
-      "POST",
-      "PUT",
-      "PATCH",
-      "DELETE",
-      "OPTIONS"
-    ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -76,29 +66,15 @@ app.use(
   })
 );
 
-app.use(
-  express.json({
-    limit: "50mb"
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-    limit: "50mb"
-  })
-);
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const isVercel = Boolean(process.env.VERCEL);
-
 const uploadsPath = isVercel
   ? path.join("/tmp", "uploads")
   : path.join(__dirname, "uploads");
 
-app.use(
-  "/uploads",
-  express.static(uploadsPath)
-);
+app.use("/uploads", express.static(uploadsPath));
 
 const healthHandler = (_req, res) => {
   res.status(200).json({
@@ -114,6 +90,7 @@ app.get("/api/health", healthHandler);
 app.use("/api/navlinks", navlinksRouter);
 app.use("/api/products", productsRouter);
 app.use("/api/categories", categoriesRouter);
+app.use("/api/brands", brandsRouter);
 app.use("/api/auth", authRouter);
 app.use("/api/upload", uploadRouter);
 app.use("/api/orders", ordersRouter);
@@ -143,14 +120,10 @@ app.use((req, res) => {
 app.use((err, _req, res, _next) => {
   console.error("[app] Unhandled error:", err);
 
-  const statusCode =
-    Number(err.statusCode || err.status) || 500;
+  const statusCode = Number(err.statusCode || err.status) || 500;
 
   res.status(statusCode).json({
-    error:
-      statusCode === 403
-        ? "Origin is not allowed"
-        : "Internal server error",
+    error: statusCode === 403 ? "Origin is not allowed" : "Internal server error",
     detail:
       process.env.NODE_ENV === "production"
         ? undefined
@@ -162,9 +135,7 @@ const PORT = Number(process.env.PORT || 5000);
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(
-      `Server running on http://localhost:${PORT}`
-    );
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
