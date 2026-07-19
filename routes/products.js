@@ -8,6 +8,23 @@ const { ensureInventoryRows, getLocationByCode } = require('../lib/inventory');
 
 const router = express.Router();
 
+function disableImportCache(req, res, next) {
+  delete req.headers['if-none-match'];
+  delete req.headers['if-modified-since'];
+
+  res.set({
+    'Cache-Control':
+      'private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Surrogate-Control': 'no-store',
+    'CDN-Cache-Control': 'no-store',
+    'Vercel-CDN-Cache-Control': 'no-store'
+  });
+
+  next();
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -3415,6 +3432,7 @@ router.post(
 
 router.get(
   '/imports',
+  disableImportCache,
   async (req, res) => {
     try {
       const limit = Math.min(
@@ -3430,14 +3448,27 @@ router.get(
 
       const result =
         await pool.query(
-          `SELECT *
+          `SELECT
+             id,
+             file_name,
+             import_type,
+             status,
+             total_rows,
+             success_rows,
+             failed_rows,
+             error_message,
+             options,
+             started_at,
+             completed_at,
+             created_at,
+             updated_at
            FROM product_import_jobs
            ORDER BY created_at DESC
            LIMIT $1`,
           [limit]
         );
 
-      return res.json({
+      return res.status(200).json({
         jobs: result.rows
       });
     } catch (error) {
@@ -3452,11 +3483,25 @@ router.get(
 
 router.get(
   '/imports/:jobId',
+  disableImportCache,
   async (req, res) => {
     try {
       const job =
         await pool.query(
-          `SELECT *
+          `SELECT
+             id,
+             file_name,
+             import_type,
+             status,
+             total_rows,
+             success_rows,
+             failed_rows,
+             error_message,
+             options,
+             started_at,
+             completed_at,
+             created_at,
+             updated_at
            FROM product_import_jobs
            WHERE id = $1
            LIMIT 1`,
@@ -3472,7 +3517,18 @@ router.get(
 
       const rows =
         await pool.query(
-          `SELECT *
+          `SELECT
+             id,
+             job_id,
+             sheet_name,
+             row_number,
+             sku,
+             barcode,
+             operation_status,
+             product_id,
+             error_message,
+             raw_data,
+             created_at
            FROM product_import_rows
            WHERE job_id = $1
            ORDER BY
@@ -3481,7 +3537,7 @@ router.get(
           [req.params.jobId]
         );
 
-      return res.json({
+      return res.status(200).json({
         job: job.rows[0],
         rows: rows.rows
       });
